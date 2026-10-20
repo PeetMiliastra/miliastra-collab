@@ -1,0 +1,40 @@
+{
+  "name": "miliastra-collab",
+  "version": "0.1.66",
+  "private": true,
+  "license": "GPL-3.0-or-later",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc -b && vite build",
+    "test": "vitest run",
+    "tauri": "tauri",
+    "desktop": "tauri dev",
+    "package": "tauri build --no-bundle",
+    "format": "prettier --write src vite.config.ts \"tests/**/*.{cjs,js}\" && python -m ruff format scripts tests",
+    "format:check": "prettier --check src vite.config.ts \"tests/**/*.{cjs,js}\" && python -m ruff format --check scripts tests",
+    "test:ui": "node tests/ui-smoke.cjs",
+    "test:reliability": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/reliability.ps1 -Build",
+    "test:reliability:proxy": "node --test tests/reliability/proxy.test.cjs"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2",
+    "lucide-react": "^0.468",
+    "react": "^19",
+    "react-dom": "^19"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "@testing-library/jest-dom": "^6",
+    "@testing-library/react": "^16",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@vitejs/plugin-react": "^4",
+    "jsdom": "^26",
+    "playwright": "^1.64.1",
+    "prettier": "^3.9.10",
+    "typescript": "^5.7",
+    "vite": "^6",
+    "vitest": "^3"
+  }
+}

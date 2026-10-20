@@ -1,0 +1,46 @@
+name: Desktop app checks
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: {node-version: '24', cache: npm}
+      - uses: dtolnay/rust-toolchain@1.90.0
+      - run: python scripts/check-contract.py
+      - run: python -m unittest discover -s tests -p test_logo_metadata.py
+      - run: python -m unittest discover -s tests -p test_interface_text.py
+      - run: python scripts/generate-contracts.py --check
+      - run: npm ci
+      - run: pip install ruff==0.13.3
+      - run: npm run format:check
+      - run: node tests/private-wire-codec.cjs
+      - run: npm test
+      - run: npm run build
+      - run: cargo test -p miliastra-core
+      - run: cargo test -p miliastra-collab --lib
+      - name: Browser workflow proof
+        shell: pwsh
+        run: |
+          npx playwright install chromium
+          $env:CHROME_PATH = node -p "require('playwright').chromium.executablePath()"
+          $preview = Start-Process node -ArgumentList 'node_modules/vite/bin/vite.js --host 127.0.0.1 --port 1420' -WindowStyle Hidden -PassThru
+          try {
+            for ($attempt = 0; $attempt -lt 30; $attempt++) {
+              try { Invoke-WebRequest http://127.0.0.1:1420 -UseBasicParsing | Out-Null; break } catch { Start-Sleep -Milliseconds 500 }
+            }
+            node tests/ui-smoke.cjs
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            node tests/demo-smoke.cjs
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            node tests/design-smoke.cjs
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            node tests/join-wizard-smoke.cjs
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            node tests/asset-browser-layout.cjs
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } finally { Stop-Process -Id $preview.Id -ErrorAction SilentlyContinue }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: {name: interface-proof, path: build/ui-proof}

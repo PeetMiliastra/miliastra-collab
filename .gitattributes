@@ -1,0 +1,2 @@
+# Keep formatter output identical on Windows and other platforms.
+* text=auto eol=lf

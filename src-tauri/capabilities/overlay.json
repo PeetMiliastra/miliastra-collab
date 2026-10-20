@@ -1,0 +1,11 @@
+{
+  "identifier": "overlay",
+  "description": "Read-only notification window; no filesystem, shell, or project commands.",
+  "windows": [
+    "overlay"
+  ],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
+  ]
+}

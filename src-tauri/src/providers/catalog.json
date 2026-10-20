@@ -1,0 +1,23 @@
+[
+  {
+    "id": "folder",
+    "name": "Shared folder",
+    "cloud": false,
+    "enabled": true,
+    "setupMessage": "Checking shared folder\u2026"
+  },
+  {
+    "id": "onedrive",
+    "name": "OneDrive",
+    "cloud": true,
+    "enabled": true,
+    "setupMessage": "Creating OneDrive folder\u2026"
+  },
+  {
+    "id": "google",
+    "name": "Google Drive",
+    "cloud": true,
+    "enabled": false,
+    "setupMessage": "Creating Google Drive folders\u2026"
+  }
+]

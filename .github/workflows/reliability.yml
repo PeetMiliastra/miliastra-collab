@@ -1,0 +1,47 @@
+name: Native collaboration reliability
+on:
+  workflow_dispatch:
+    inputs:
+      cycles:
+        description: Seeded edit cycles (1 to 100)
+        default: '16'
+        required: true
+      seed:
+        description: Reproducible seed
+        default: '73019'
+        required: true
+permissions:
+  contents: read
+jobs:
+  rehearsal:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      RELIABILITY_CYCLES: ${{ inputs.cycles }}
+      RELIABILITY_SEED: ${{ inputs.seed }}
+      # tests/coordinator.cjs builds the real coordinator from here and runs it on a
+      # throwaway database, using the runner's preinstalled PostgreSQL (PGBIN).
+      MCOLLAB_COORDINATOR_DIR: ${{ github.workspace }}/coordinator
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: PeetMiliastra/miliastra-collab-coordinator
+          path: coordinator
+      - uses: actions/setup-node@v4
+        with: {node-version: '24', cache: npm}
+      - uses: dtolnay/rust-toolchain@1.90.0
+      - run: npm ci
+      - run: npm run test:reliability:proxy
+      - name: App against the real coordinator
+        run: node tests/coordinator.cjs --port=0 -- cargo test -p miliastra-collab --lib service_tests
+      - name: Real native clients and disposable shared-folder project
+        shell: pwsh
+        run: ./tests/reliability.ps1 -Build -Cycles $env:RELIABILITY_CYCLES -Seed $env:RELIABILITY_SEED
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-reliability-summary
+          path: |
+            .tools/reliability-*/report.json
+            .tools/reliability-*/privacy-audit.json

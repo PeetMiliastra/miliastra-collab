@@ -1,0 +1,87 @@
+name: Build signed portable Windows release
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish to GitHub Releases (otherwise save build artifacts only)
+        type: boolean
+        default: false
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      MCOLLAB_SERVICE_URL: ${{ vars.MCOLLAB_SERVICE_URL }}
+      MCOLLAB_MICROSOFT_CLIENT_ID: ${{ vars.MCOLLAB_MICROSOFT_CLIENT_ID || 'a64478d4-2a7a-414b-ac00-a467e00dcbed' }}
+      MCOLLAB_GOOGLE_CLIENT_ID: ${{ vars.MCOLLAB_GOOGLE_CLIENT_ID || '417518576886-28frelv6e9c4tqiam38ioul14srsvgra.apps.googleusercontent.com' }}
+      MCOLLAB_GOOGLE_CLIENT_SECRET: ${{ secrets.MCOLLAB_GOOGLE_CLIENT_SECRET }}
+      MCOLLAB_UPDATE_URL: https://github.com/${{ github.repository }}/releases/latest/download/latest.json
+      MCOLLAB_UPDATE_PUBKEY: ${{ vars.MCOLLAB_UPDATE_PUBKEY }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: {node-version: '24', cache: npm}
+      - uses: dtolnay/rust-toolchain@1.90.0
+      - name: Validate release configuration
+        shell: pwsh
+        run: |
+          foreach ($key in 'MCOLLAB_SERVICE_URL','MCOLLAB_MICROSOFT_CLIENT_ID','MCOLLAB_UPDATE_PUBKEY','TAURI_SIGNING_PRIVATE_KEY') {
+            if (-not [Environment]::GetEnvironmentVariable($key)) { throw "Required release setting is missing: $key" }
+          }
+          if (([Uri]$env:MCOLLAB_SERVICE_URL).Scheme -ne 'https') { throw 'Release service must use HTTPS' }
+      - run: python scripts/check-contract.py
+      - run: python scripts/generate-contracts.py --check
+      - run: npm ci
+      - run: npm test
+      - run: cargo test -p miliastra-core
+      - run: cargo test -p miliastra-collab --lib
+      - run: python tests/test_update_feed.py
+      - run: npm run package
+      - name: Optional Windows Authenticode signature
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if (-not $env:WINDOWS_CERTIFICATE) { Write-Output 'Authenticode certificate not configured; updater signatures remain mandatory.'; exit 0 }
+          $certificatePath = Join-Path $env:RUNNER_TEMP 'miliastra-signing.pfx'
+          try {
+            [IO.File]::WriteAllBytes($certificatePath,[Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+            $password = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+            $certificate = Import-PfxCertificate -FilePath $certificatePath -CertStoreLocation Cert:/CurrentUser/My -Password $password
+            $sdk = Join-Path ([Environment]::GetEnvironmentVariable('ProgramFiles(x86)')) 'Windows Kits/10/bin'
+            $signTool = Get-ChildItem $sdk -Recurse -Filter signtool.exe | Where-Object { $_.Directory.Name -eq 'x64' } | Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+            if (-not $signTool) { throw 'Windows signing tool unavailable' }
+            & $signTool sign /sha1 $certificate.Thumbprint /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 target/release/miliastra-collab.exe
+            if ($LASTEXITCODE -ne 0) { throw 'Authenticode signing failed' }
+          } finally { Remove-Item -LiteralPath $certificatePath -ErrorAction SilentlyContinue }
+      - name: Sign portable executable and create feed
+        shell: pwsh
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          New-Item -ItemType Directory -Path portable | Out-Null
+          Copy-Item -LiteralPath target/release/miliastra-collab.exe -Destination portable/miliastra-collab.exe
+          npx tauri signer sign --app-version $version portable/miliastra-collab.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Portable updater signing failed' }
+          python scripts/make-update-feed.py --version $version --url "https://github.com/$env:GITHUB_REPOSITORY/releases/download/v$version/miliastra-collab.exe" --signature portable/miliastra-collab.exe.sig --notes "miliastra/collab $version" --output portable/latest.json
+          if ($LASTEXITCODE -ne 0) { throw 'Portable manifest generation failed' }
+          Get-FileHash portable/miliastra-collab.exe -Algorithm SHA256 | Format-List | Out-File portable/SHA256.txt
+          "RELEASE_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - uses: actions/upload-artifact@v4
+        with:
+          name: signed-portable-windows-release
+          path: portable/*
+      - name: Publish portable GitHub release
+        if: inputs.publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $visibility = gh api "repos/$env:GITHUB_REPOSITORY" --jq .private
+          if ($LASTEXITCODE -ne 0 -or $visibility -ne 'false') { throw 'Use a public release repository so creators can download without GitHub credentials.' }
+          gh release create "v$env:RELEASE_VERSION" portable/miliastra-collab.exe portable/miliastra-collab.exe.sig portable/latest.json portable/SHA256.txt --target $env:GITHUB_SHA --title "miliastra/collab $env:RELEASE_VERSION" --generate-notes --latest
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub release publishing failed' }
