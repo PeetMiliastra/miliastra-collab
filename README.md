@@ -1,3 +1,5 @@
+![miliastra collab screenshot](https://github.com/PeetMiliastra/miliastra-collab/blob/main/docs/screenshot.png?raw=true)
+
 # miliastra/collab
 A Windows app that aims to solve some flaws of the Shared Creation system in Miliastra Wonderland. Facilitates slice-locking, automatic syncing, and version history, among other things.
 
