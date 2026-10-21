@@ -230,8 +230,8 @@ class Client {
     await this.call("refresh");
     return this.call("snapshot");
   }
-  async wait(predicate) {
-    for (let n = 0; n < 240; n++) {
+  async wait(predicate, timeoutMs = 24000) {
+    for (let n = 0; n < Math.ceil(timeoutMs / 100); n++) {
       const s = await this.call("snapshot");
       if (predicate(s)) return s;
       await sleep(100);
@@ -450,15 +450,57 @@ async function history(client) {
         );
       },
     );
-    await step("missed events reconcile through ordinary refresh", async () => {
-      proxy.setEvents(false);
-      await a.edit(7, "PrivateChangeCanary missed event");
-      await a.share([7], "PrivateChangeCanary missed event");
-      sequence++;
-      await b.apply();
-      proxy.setEvents(true);
-      assert.equal((await b.refresh()).project.sequence, sequence);
-    });
+    await step(
+      "healthy idle sockets do not poll project state or cached History",
+      async () => {
+        await a.call("finish_work");
+        await b.call("finish_work");
+        await Promise.all([a.refresh(), b.refresh()]);
+        for (let n = 0; n < 150 && proxy.bridges.size < 2; n++)
+          await sleep(100);
+        assert(
+          proxy.bridges.size >= 2,
+          "Both live connections must be established",
+        );
+        // Drain join/presence notifications before measuring a full former polling interval.
+        await sleep(1000);
+        const start = proxy.records.length;
+        await sleep(35000);
+        const repeated = proxy.records
+          .slice(start)
+          .filter(
+            (r) =>
+              r.method === "GET" &&
+              /^\/projects\/[^/]+(?:\/history(?:\?.*)?)?$/.test(r.path),
+          );
+        assert.deepEqual(
+          repeated.map((r) => r.path),
+          [],
+          "Idle clients downloaded unchanged project/history metadata",
+        );
+        assert(
+          proxy.bridges.size >= 2,
+          "Keep-alive must preserve both sockets",
+        );
+      },
+    );
+    await step(
+      "missed events reconcile automatically without a live socket",
+      async () => {
+        proxy.setEvents(false);
+        await a.edit(7, "PrivateChangeCanary missed event");
+        await a.share([7], "PrivateChangeCanary missed event");
+        sequence++;
+        // Do not invoke manual refresh until the disconnected fallback has caught up.
+        await b.wait(
+          (s) => s.project.sequence === sequence && !s.metadataPending,
+          45000,
+        );
+        await b.apply();
+        proxy.setEvents(true);
+        assert.equal((await b.refresh()).project.sequence, sequence);
+      },
+    );
     await step("coordinator outage preserves work and changelog", async () => {
       await a.edit(8, "PrivateChangeCanary offline");
       proxy.setOffline(true);

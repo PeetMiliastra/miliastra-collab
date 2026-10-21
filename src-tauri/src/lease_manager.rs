@@ -27,9 +27,49 @@ where
         .collect()
         .await
 }
+/// The UI can use our own renewal responses without downloading another full view.
+/// A response for an older fence or another owner must never replace newer ownership.
+pub fn apply_renewals(cached: &mut [Lease], renewed: &BTreeMap<String, Lease>) {
+    for lease in cached {
+        if let Some(latest) = renewed.get(&lease.section).filter(|l| {
+            l.fence == lease.fence && l.member == lease.member && l.expires > lease.expires
+        }) {
+            lease.expires = latest.expires;
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn own_cached_reservations_stay_current_without_overwriting_a_takeover() {
+        let lease = |section: &str, member: &str, fence, expires| Lease {
+            section: section.into(),
+            member: member.into(),
+            name: member.into(),
+            fence,
+            expires,
+        };
+        let mut cached = vec![
+            lease("a", "me", 1, 120),
+            lease("b", "other", 2, 120),
+            lease("c", "me", 3, 120),
+        ];
+        let renewed = [
+            lease("a", "me", 1, 240),
+            lease("b", "me", 1, 240),
+            lease("c", "me", 2, 240),
+        ]
+        .into_iter()
+        .map(|l| (l.section.clone(), l))
+        .collect();
+        apply_renewals(&mut cached, &renewed);
+        assert_eq!(cached[0].expires, 240);
+        assert_eq!(cached[1].member, "other");
+        assert_eq!(cached[1].expires, 120);
+        assert_eq!(cached[2].fence, 3);
+        assert_eq!(cached[2].expires, 120);
+    }
     #[tokio::test]
     async fn renewals_overlap_and_one_failure_does_not_starve_others() {
         let leases = (0..32)

@@ -4,6 +4,7 @@ mod conflict_runtime;
 mod conflicts;
 mod coordination;
 mod coordinator_client;
+mod coordinator_sync;
 mod credentials;
 mod db;
 mod editor_detector;
@@ -44,8 +45,6 @@ use tauri::{
     Emitter, Manager,
 };
 use tauri_plugin_deep_link::DeepLinkExt;
-/// How often the live project connection sends a keep-alive ping.
-const KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(30);
 type Cmd<T> = Result<T, String>;
 fn err(e: anyhow::Error) -> String {
     e.to_string()
@@ -816,11 +815,48 @@ pub fn show_notice(app: &tauri::AppHandle, text: &str) {
         .show();
 }
 fn start_background(app: tauri::AppHandle) {
+    use coordinator_sync::{Refresh, KEEPALIVE, RECONNECT_DELAY, SOCKET_CHECK};
+    use tokio::time::MissedTickBehavior;
+    let sync_app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let c = sync_app.state::<Core>();
+        loop {
+            let work = c.coordinator_sync.next().await;
+            {
+                let _guard = c.operation.lock().await;
+                if !c
+                    .active
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|p| p.sync_session() == work.session)
+                {
+                    continue;
+                }
+                if work.refresh != Refresh::None
+                    && c.sync(work.refresh == Refresh::Full).await.is_err()
+                {
+                    c.online.store(false, Ordering::Relaxed);
+                    c.changed();
+                }
+            }
+            if work.grant_access
+                && c.active
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|p| p.sync_session() == work.session)
+            {
+                let _ = c.grant_pending_access().await;
+            }
+        }
+    });
     let heartbeat_app = app.clone();
     tauri::async_runtime::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(
             miliastra_core::constants::LEASE_RENEW_INTERVAL_SECS,
         ));
+        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
             let c = heartbeat_app.state::<Core>();
@@ -835,6 +871,7 @@ fn start_background(app: tauri::AppHandle) {
     let download_app = app.clone();
     tauri::async_runtime::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(3));
+        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
             let c = download_app.state::<Core>();
@@ -852,6 +889,7 @@ fn start_background(app: tauri::AppHandle) {
     let polling_app = app.clone();
     tauri::async_runtime::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut counter = 0u64;
         loop {
             tick.tick().await;
@@ -871,15 +909,25 @@ fn start_background(app: tauri::AppHandle) {
                 }
             }
 
-            if counter % 15 == 0 {
-                {
-                    let _guard = c.operation.lock().await;
-                    if c.sync(false).await.is_err() {
-                        c.online.store(false, Ordering::Relaxed);
-                        c.changed();
-                    }
+            let observed = c.active.lock().unwrap().as_ref().map(|p| {
+                // Renewals are not broadcast by the service. Recheck teammates' locks
+                // before their cached expiry rather than showing an occupied slice as free.
+                let now = chrono::Utc::now().timestamp();
+                let reservation_due = p.project.locks.iter().any(|l| {
+                    l.member != p.member && coordinator_sync::reservation_due(l.expires, now)
+                });
+                (p.sync_session(), reservation_due)
+            });
+            if let Some((session, reservation_due)) = observed {
+                if c.coordinator_sync.due(
+                    &session,
+                    c.online.load(Ordering::Relaxed),
+                    reservation_due,
+                    std::time::Instant::now(),
+                ) {
+                    c.coordinator_sync
+                        .request(session, Refresh::Incremental, true);
                 }
-                let _ = c.grant_pending_access().await;
             }
         }
     });
@@ -905,16 +953,22 @@ fn start_background(app: tauri::AppHandle) {
                             req.headers_mut().insert("Authorization", value);
                             if let Ok((mut socket, _)) = tokio_tungstenite::connect_async(req).await
                             {
-                                {
-                                    let _guard = c.operation.lock().await;
-                                    let _ = c.sync(false).await;
-                                }
-                                // Share the team folder with anyone who asked while this app was closed.
-                                let _ = c.grant_pending_access().await;
+                                let session = p.sync_session();
+                                c.coordinator_sync
+                                    .received(session.clone(), std::time::Instant::now());
+                                // Keep reading and pinging the socket while reconciliation or
+                                // storage access runs in the worker. Reconnect always catches up.
+                                c.coordinator_sync.request(
+                                    session.clone(),
+                                    Refresh::Incremental,
+                                    true,
+                                );
                                 // Presence: send our encrypted "in Miliastra" status whenever it changes.
                                 let mut reported_game = None;
                                 // Cloudflare drops connections that are quiet for about 100 seconds.
                                 let mut last_ping = std::time::Instant::now();
+                                let mut socket_tick = tokio::time::interval(SOCKET_CHECK);
+                                socket_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
                                 let game = native::game_state().running;
                                 if let Ok(text) = c.presence_message(&p, game) {
                                     if socket
@@ -930,18 +984,20 @@ fn start_background(app: tauri::AppHandle) {
                                 loop {
                                     tokio::select! {
                                         message = socket.next() => match message {
-                                            Some(Ok(msg)) if msg.is_text() => {
-                                                let event = msg
-                                                    .to_text()
-                                                    .ok()
-                                                    .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
-                                                    .unwrap_or_default();
-                                                c.handle_event(&p, event).await;
+                                            Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | None | Some(Err(_)) => break,
+                                            Some(Ok(msg)) => {
+                                                c.coordinator_sync.received(session.clone(), std::time::Instant::now());
+                                                if let Ok(text) = msg.to_text() {
+                                                    if let Ok(event) = serde_json::from_str(text) {
+                                                        c.handle_event(&p, event);
+                                                    }
+                                                }
                                             }
-                                            None | Some(Err(_)) => break,
-                                            _ => {}
                                         },
-                                        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                                        _ = socket_tick.tick() => {
+                                            if !c.coordinator_sync.socket_alive(&session, std::time::Instant::now()) {
+                                                break;
+                                            }
                                             if last_ping.elapsed() >= KEEPALIVE {
                                                 if socket
                                                     .send(tokio_tungstenite::tungstenite::Message::Ping(Vec::new().into()))
@@ -969,19 +1025,20 @@ fn start_background(app: tauri::AppHandle) {
                                                 .lock()
                                                 .unwrap()
                                                 .as_ref()
-                                                .is_some_and(|a| a.project.id == p.project.id)
+                                                .is_some_and(|a| a.sync_session() == session)
                                             {
                                                 break;
                                             }
                                         }
                                     }
                                 }
+                                c.coordinator_sync.disconnected(&session);
                             }
                         }
                     }
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            tokio::time::sleep(RECONNECT_DELAY).await;
         }
     });
 }

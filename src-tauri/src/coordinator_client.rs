@@ -274,4 +274,60 @@ mod tests {
             .is_err());
         assert!(!fresh.protocol_mismatch(&ep, "p"));
     }
+
+    #[tokio::test]
+    async fn requests_gzip_and_reads_compressed_coordinator_responses() {
+        use axum::{http::HeaderMap, routing::get, Router};
+        // A fixed gzip response keeps this regression independent of server middleware
+        // and tests the actual HTTP client, including Accept-Encoding negotiation.
+        const COMPRESSED: &[u8] = &[
+            31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 237, 197, 193, 9, 128, 48, 16, 0, 176, 93, 238, 173,
+            11, 116, 27, 193, 43, 138, 15, 161, 182, 32, 136, 187, 59, 136, 201, 39, 79, 156, 71,
+            148, 222, 70, 78, 177, 229, 178, 94, 81, 162, 238, 119, 31, 45, 103, 219, 182, 109,
+            219, 182, 109, 219, 182, 109, 219, 182, 109, 219, 182, 109, 219, 182, 109, 219, 182,
+            109, 219, 246, 191, 143, 247, 3, 178, 36, 198, 39, 150, 62, 0, 0,
+        ];
+        let router = Router::new().route(
+            "/projects/p",
+            get(|headers: HeaderMap| async move {
+                assert!(headers
+                    .get("accept-encoding")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .contains("gzip"));
+                (
+                    [
+                        (
+                            "x-miliastra-contract",
+                            miliastra_core::contract_fingerprint(),
+                        ),
+                        ("content-encoding", "gzip"),
+                        ("content-type", "application/json"),
+                    ],
+                    COMPRESSED.to_vec(),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let value = CoordinatorClient::new()
+            .unwrap()
+            .request(
+                &endpoint,
+                "p",
+                "token".into(),
+                reqwest::Method::GET,
+                "",
+                None,
+            )
+            .await
+            .unwrap();
+        task.abort();
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["heads"], "fixture-".repeat(2000));
+    }
 }

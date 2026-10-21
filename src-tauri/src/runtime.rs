@@ -29,6 +29,11 @@ pub struct LocalProject {
     pub folder: Option<PathBuf>,
     pub installed: BTreeMap<String, Revision>,
 }
+impl LocalProject {
+    pub(crate) fn sync_session(&self) -> crate::coordinator_sync::Session {
+        crate::coordinator_sync::Session::new(&self.endpoint, &self.project.id, &self.member)
+    }
+}
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
@@ -157,6 +162,7 @@ fn next_history_cursor(
 }
 pub struct Core {
     pub coordinator: crate::coordinator_client::CoordinatorClient,
+    pub coordinator_sync: crate::coordinator_sync::CoordinatorSync,
     pub app: AppHandle,
     pub data: PathBuf,
     pub db: Db,
@@ -252,6 +258,7 @@ impl Core {
         }
         Ok(Self {
             coordinator: crate::coordinator_client::CoordinatorClient::new()?,
+            coordinator_sync: Default::default(),
             app,
             data,
             db,
@@ -787,7 +794,17 @@ impl Core {
         Ok(())
     }
     pub fn snapshot(&self) -> Result<Snapshot> {
-        let active = self.active.lock().unwrap().clone();
+        let active = {
+            let active = self.active.lock().unwrap();
+            let mut snapshot = active.clone();
+            if let Some(p) = &mut snapshot {
+                crate::lease_manager::apply_renewals(
+                    &mut p.project.locks,
+                    &self.leases.lock().unwrap(),
+                );
+            }
+            snapshot
+        };
         let mut sections = vec![];
         let draft = if let Some(p) = &active {
             let pending = self.installation(p)?;
@@ -1625,8 +1642,17 @@ impl Core {
         warned
     }
     /// Handles an event from the live connection. Notices for one member are shown
-    /// directly; everything else triggers a sync.
-    pub async fn handle_event(&self, p: &LocalProject, event: serde_json::Value) {
+    /// directly; other changes queue a coalesced refresh without blocking the socket.
+    pub fn handle_event(&self, p: &LocalProject, event: serde_json::Value) {
+        use crate::coordinator_sync::Refresh;
+        // Use current member names and slice labels, rather than the snapshot taken
+        // when this potentially long-lived socket first connected.
+        let session = p.sync_session();
+        let current = match self.active.lock().unwrap().clone() {
+            Some(current) if current.sync_session() == session => current,
+            _ => return,
+        };
+        let p = &current;
         let event = match self
             .privacy_keys(&p.endpoint, &p.project.id)
             .and_then(|keys| keys.open_events(&p.endpoint, &p.project.id, event))
@@ -1678,29 +1704,29 @@ impl Core {
                     slice: &name,
                 });
             }
-            let _guard = self.operation.lock().await;
-            let _ = self.sync(false).await;
+            self.coordinator_sync
+                .request(p.sync_session(), Refresh::Incremental, false);
             return;
         }
         if event["kind"] == "removed" {
             if event["member"].as_str() == Some(p.member.as_str()) {
                 self.mark_removed(p);
             } else {
-                let _guard = self.operation.lock().await;
-                let _ = self.sync(false).await;
+                self.coordinator_sync
+                    .request(p.sync_session(), Refresh::Incremental, false);
             }
             return;
         }
         if event["kind"] == "access-request" {
-            let _ = self.grant_pending_access().await;
+            self.coordinator_sync
+                .request(p.sync_session(), Refresh::None, true);
             return;
         }
-        let _guard = self.operation.lock().await;
-        let full = event["kind"] == "history" || event["kind"] == "reconcile";
-        if self.sync(full).await.is_err() {
-            self.online.store(false, Ordering::Relaxed);
-            self.changed();
-        }
+        self.coordinator_sync.request(
+            p.sync_session(),
+            Refresh::for_event(event["kind"].as_str().unwrap_or_default()),
+            false,
+        );
     }
     /// Team management: remove a member or hand over ownership.
     pub async fn manage_team(&self, route: &str, body: serde_json::Value) -> Result<()> {
@@ -1833,6 +1859,8 @@ impl Core {
     }
     pub async fn sync(&self, full_history: bool) -> Result<()> {
         let mut p = self.active()?;
+        self.coordinator_sync
+            .attempted(p.sync_session(), std::time::Instant::now());
         let view: ProjectView = self.api(&p, reqwest::Method::GET, "", None).await?;
         ensure!(view.id==p.project.id&&view.storage==p.project.storage,"The project storage binding changed. Stop and verify with your team before reconnecting.");
         p.project = view;
@@ -1850,53 +1878,57 @@ impl Core {
         }
         let marker = format!("history-cache-complete:{}", p.project.id);
         let known = self.db.get::<u64>(&marker)?.unwrap_or(0);
-        let mut latest = known;
-        let mut before: Option<u64> = None;
-        loop {
-            let suffix = format!(
-                "/history{}",
-                before
-                    .map(|n: u64| format!("?before={n}"))
-                    .unwrap_or_default()
-            );
-            let page: HistoryPage = self.api(&p, reqwest::Method::GET, &suffix, None).await?;
-            for u in &page.entries {
-                latest = latest.max(u.sequence);
-                self.db.cache(&p.project.id, u)?;
-                let key = format!("pending:{}", p.project.id);
-                if self
-                    .db
-                    .get::<PublishRequest>(&key)?
-                    .is_some_and(|r| r.id == u.id)
-                {
-                    for r in &u.revisions {
-                        if self.matches(&p.stage, r) {
-                            p.installed.insert(r.section.clone(), r.clone());
+        // A live lock/presence event or safety check does not change published history.
+        // Keep explicit full refreshes, cold-cache recovery and metadata retry paths.
+        if crate::coordinator_sync::history_needed(known, p.project.sequence, full_history) {
+            let mut latest = known;
+            let mut before: Option<u64> = None;
+            loop {
+                let suffix = format!(
+                    "/history{}",
+                    before
+                        .map(|n: u64| format!("?before={n}"))
+                        .unwrap_or_default()
+                );
+                let page: HistoryPage = self.api(&p, reqwest::Method::GET, &suffix, None).await?;
+                for u in &page.entries {
+                    latest = latest.max(u.sequence);
+                    self.db.cache(&p.project.id, u)?;
+                    let key = format!("pending:{}", p.project.id);
+                    if self
+                        .db
+                        .get::<PublishRequest>(&key)?
+                        .is_some_and(|r| r.id == u.id)
+                    {
+                        for r in &u.revisions {
+                            if self.matches(&p.stage, r) {
+                                p.installed.insert(r.section.clone(), r.clone());
+                            }
                         }
+                        self.persist(&p)?;
+                        self.db.remove(&key)?;
+                        self.db
+                            .set(&format!("draft:{}", p.project.id), &Draft::default())?;
+                        let _ = self.app.emit("draft-shared", ());
                     }
-                    self.persist(&p)?;
-                    self.db.remove(&key)?;
-                    self.db
-                        .set(&format!("draft:{}", p.project.id), &Draft::default())?;
-                    let _ = self.app.emit("draft-shared", ());
+                    let names_key = format!("pending-names:{}", p.project.id);
+                    if self
+                        .db
+                        .get::<PublishNames>(&names_key)?
+                        .is_some_and(|r| r.id == u.id)
+                    {
+                        self.db.remove(&names_key)?;
+                        crate::names::clear_published(&self.db, &p.project.id, &u.name_changes)?;
+                    }
                 }
-                let names_key = format!("pending-names:{}", p.project.id);
-                if self
-                    .db
-                    .get::<PublishNames>(&names_key)?
-                    .is_some_and(|r| r.id == u.id)
-                {
-                    self.db.remove(&names_key)?;
-                    crate::names::clear_published(&self.db, &p.project.id, &u.name_changes)?;
+                match next_history_cursor(known, full_history, before, &page)? {
+                    Some(next) => before = Some(next),
+                    None => break,
                 }
             }
-            match next_history_cursor(known, full_history, before, &page)? {
-                Some(next) => before = Some(next),
-                None => break,
-            }
+            self.db.set(&marker, &latest)?;
+            let _ = self.app.emit("history-changed", ());
         }
-        self.db.set(&marker, &latest)?;
-        let _ = self.app.emit("history-changed", ());
         self.changed();
         Ok(())
     }
@@ -2253,6 +2285,11 @@ impl Core {
         }
         drop(active);
         if lost {
+            self.coordinator_sync.request(
+                p.sync_session(),
+                crate::coordinator_sync::Refresh::Incremental,
+                false,
+            );
             self.changed();
         }
         failure.map_or(Ok(()), Err)
