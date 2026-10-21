@@ -26,6 +26,17 @@ jobs:
       - uses: actions/setup-node@v4
         with: {node-version: '24', cache: npm}
       - uses: dtolnay/rust-toolchain@1.90.0
+      - name: Check release tag availability
+        if: inputs.publish
+        shell: pwsh
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $tag = "v$version"
+          git ls-remote --exit-code --tags origin "refs/tags/$tag"
+          $result = $LASTEXITCODE
+          if ($result -eq 0) { throw "Release tag $tag already exists. Bump the app version before publishing a new release." }
+          if ($result -ne 2) { throw 'Could not check existing release tags. Check repository access and retry.' }
+          exit 0
       - name: Validate release configuration
         shell: pwsh
         run: |
