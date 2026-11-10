@@ -368,6 +368,9 @@ pub fn comparison_field(field: &Field, section: &str) -> Result<Vec<u8>> {
     if [1, 40, 53].contains(&field.number) {
         return Ok(vec![]);
     }
+    let normalized = comparison_dictionary_field(field)?;
+    let normalized_fields = fields(&normalized)?;
+    let field = &normalized_fields[0];
     if section != "shared" {
         return Ok(field.raw.clone());
     }
@@ -449,6 +452,114 @@ pub fn comparison_field(field: &Field, section: &str) -> Result<Vec<u8>> {
         }),
         _ => Ok(field.raw.clone()),
     }
+}
+// Only follow observed object-variable and structure-default message routes. Arbitrary
+// strings, packed IDs and unknown blobs must never be interpreted as protobuf trees.
+fn comparison_dictionary_field(field: &Field) -> Result<Vec<u8>> {
+    let routes: &[&[u64]] = match field.number {
+        4 => &[&[1, 8, 11, 1, 4], &[1, 8, 11, 1, 6]],
+        5 | 8 => &[&[1, 7, 11, 1, 4], &[1, 7, 11, 1, 6]],
+        10 => &[&[6, 1, 3, 3], &[6, 2, 3, 3]],
+        _ => return Ok(field.raw.clone()),
+    };
+    let mut result = field.raw.clone();
+    for route in routes {
+        let parsed = fields(&result)?;
+        result = comparison_value_path(&parsed[0], route);
+    }
+    Ok(result)
+}
+fn comparison_value_path(field: &Field, path: &[u64]) -> Vec<u8> {
+    if field.wire != 2 {
+        return field.raw.clone();
+    }
+    let Ok(children) = fields(&field.value) else {
+        return field.raw.clone();
+    };
+    let projected: Vec<u8> = if let Some((&next, rest)) = path.split_first() {
+        children
+            .iter()
+            .flat_map(|child| {
+                if child.number == next {
+                    comparison_value_path(child, rest)
+                } else {
+                    child.raw.clone()
+                }
+            })
+            .collect()
+    } else {
+        return comparison_typed_value(field, 0);
+    };
+    if projected == field.value {
+        field.raw.clone()
+    } else {
+        length_field(field.number, &projected)
+    }
+}
+fn comparison_typed_value(field: &Field, depth: usize) -> Vec<u8> {
+    if depth >= 64 {
+        return field.raw.clone();
+    }
+    let project = || -> Result<Vec<u8>> {
+        let value = fields(&field.value)?;
+        let kind = scalar(one(&value, 1)?)?;
+        let storage = match kind {
+            25 => 35, // structure, including dictionary key/value pairs
+            27 => 37, // dictionary
+            _ => return Ok(field.raw.clone()),
+        };
+        let body = one(&value, storage)?;
+        if body.wire != 2 {
+            return Ok(field.raw.clone());
+        }
+        let parts = fields(&body.value)?;
+        let structured = kind == 25
+            && parts.iter().any(|p| p.number == 1 && p.wire == 2)
+            && scalar(one(&parts, 501)?).is_ok();
+        let mut projected = vec![];
+        for part in &parts {
+            if structured && part.number == 502 && part.wire == 2 {
+                let descriptor = fields(&part.value)?;
+                // Exact observed entry-identity descriptor; unknown variants still count.
+                if descriptor.len() == 2
+                    && scalar(one(&descriptor, 2)?)? == 28
+                    && scalar(one(&descriptor, 4)?).is_ok()
+                {
+                    projected.extend(length_field(502, &comparison_entry_identity(&descriptor)));
+                    continue;
+                }
+            }
+            if part.wire == 2
+                && (part.number == 1 || (kind == 27 && [501, 502].contains(&part.number)))
+            {
+                projected.extend(comparison_typed_value(part, depth + 1));
+            } else {
+                projected.extend(&part.raw);
+            }
+        }
+        if projected == body.value {
+            return Ok(field.raw.clone());
+        }
+        let rebuilt: Vec<u8> = value
+            .iter()
+            .flat_map(|p| {
+                if p.number == storage {
+                    length_field(storage, &projected)
+                } else {
+                    p.raw.clone()
+                }
+            })
+            .collect();
+        Ok(length_field(field.number, &rebuilt))
+    };
+    project().unwrap_or_else(|_| field.raw.clone())
+}
+fn comparison_entry_identity(descriptor: &[Field]) -> Vec<u8> {
+    descriptor
+        .iter()
+        .filter(|p| p.number != 4)
+        .flat_map(|p| p.raw.clone())
+        .collect()
 }
 /// Hash for comparing an imported resource with the saved one. Published checksums
 /// are not affected.
@@ -580,6 +691,119 @@ mod tests {
         put_varint(n << 3, &mut out);
         put_varint(v, &mut out);
         out
+    }
+    fn dictionary_fixture(guid: u64, key: u64, value: u64, extra: &[u8]) -> Vec<u8> {
+        let scalar_value = |v| [number(1, 3), length_field(13, &number(1, v))].concat();
+        let pair = [
+            number(1, 25),
+            length_field(
+                35,
+                &[
+                    length_field(1, &scalar_value(key)),
+                    length_field(1, &scalar_value(value)),
+                    number(501, 63),
+                    length_field(
+                        502,
+                        &[number(2, 28), number(4, guid), extra.to_vec()].concat(),
+                    ),
+                ]
+                .concat(),
+            ),
+        ]
+        .concat();
+        [number(1, 27), length_field(37, &length_field(1, &pair))].concat()
+    }
+    fn value_route(value: &[u8], route: &[u64]) -> Vec<u8> {
+        route
+            .iter()
+            .rev()
+            .fold(value.to_vec(), |body, n| length_field(*n, &body))
+    }
+    #[test]
+    fn dictionary_entry_ids_are_ignored_only_in_known_value_routes() {
+        let a = dictionary_fixture(1073808150, 1, 10, &[]);
+        let b = dictionary_fixture(1074397348, 1, 10, &[]);
+        for route in [
+            vec![4, 1, 8, 11, 1, 4],
+            vec![5, 1, 7, 11, 1, 4],
+            vec![8, 1, 7, 11, 1, 6],
+            vec![10, 6, 1, 3, 3],
+            vec![10, 6, 2, 3, 3],
+        ] {
+            for section in ["0", "shared"] {
+                let save = |v: &[u8]| {
+                    let data = [number(1, 1), value_route(v, &route)].concat();
+                    if section == "shared" {
+                        frame(7, &data)
+                    } else {
+                        frame(6, &length_field(2, &data))
+                    }
+                };
+                let before = save(&a);
+                let after = save(&b);
+                let compare = |v: &[u8]| import_comparison_hash(v, section).unwrap();
+                assert_eq!(
+                    compare(&before),
+                    compare(&after),
+                    "route {route:?}, {section}"
+                );
+                assert_ne!(
+                    content_hash(&before, section, "1").unwrap(),
+                    content_hash(&after, section, "1").unwrap()
+                );
+                for changed in [
+                    dictionary_fixture(1074397348, 2, 10, &[]),
+                    dictionary_fixture(1074397348, 1, 11, &[]),
+                    dictionary_fixture(1074397348, 1, 10, &number(99, 1)),
+                    [number(1, 27), length_field(37, &[])].concat(),
+                ] {
+                    assert_ne!(compare(&before), compare(&save(&changed)));
+                }
+            }
+        }
+        let unknown = |v: &[u8]| frame(7, &[number(1, 1), value_route(v, &[99, 1, 4])].concat());
+        assert_ne!(
+            import_comparison_hash(&unknown(&a), "shared").unwrap(),
+            import_comparison_hash(&unknown(&b), "shared").unwrap()
+        );
+    }
+    #[test]
+    fn nested_dictionary_entry_ids_are_ignored_without_hiding_nested_values() {
+        let nested = |guid, value| {
+            let dictionary = dictionary_fixture(guid, 1, value, &[]);
+            let pair = [
+                number(1, 25),
+                length_field(
+                    35,
+                    &[
+                        length_field(
+                            1,
+                            &[number(1, 6), length_field(16, b"Attachment Points")].concat(),
+                        ),
+                        length_field(1, &dictionary),
+                        // Structures may contain more than the two members of a dictionary pair.
+                        length_field(
+                            1,
+                            &[number(1, 3), length_field(13, &number(1, 42))].concat(),
+                        ),
+                        number(501, 63),
+                        length_field(502, &[number(2, 28), number(4, guid + 1)].concat()),
+                    ]
+                    .concat(),
+                ),
+            ]
+            .concat();
+            frame(
+                6,
+                &length_field(
+                    2,
+                    &[number(1, 1), value_route(&pair, &[4, 1, 8, 11, 1, 4])].concat(),
+                ),
+            )
+        };
+        let compare = |b: Vec<u8>| import_comparison_hash(&b, "0").unwrap();
+        assert_eq!(compare(nested(100, 10)), compare(nested(200, 10)));
+        assert_ne!(compare(nested(100, 10)), compare(nested(200, 11)));
     }
     // Sanitized shape from the imported stage before/after a no-edit editor save.
     fn shared_resave(regenerated: bool, faction: &str) -> Vec<u8> {
