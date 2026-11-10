@@ -2498,7 +2498,7 @@ dependencies = [
 
 [[package]]
 name = "miliastra-collab"
-version = "0.1.67"
+version = "0.1.68"
 dependencies = [
  "aes",
  "aes-gcm",
