@@ -431,6 +431,18 @@ impl Core {
         }
         Ok(())
     }
+    /// Shared-settings versions published in this project's synced history.
+    pub(crate) fn known_shared_versions(
+        &self,
+        p: &LocalProject,
+    ) -> Result<std::collections::BTreeSet<String>> {
+        let history = self.db.history(&p.project.id)?;
+        Ok(crate::installer::known_shared_versions(
+            &p.project.heads,
+            &p.installed,
+            history.iter().flat_map(|u| &u.revisions),
+        ))
+    }
     pub async fn preview_install(&self) -> Result<crate::installer::Plan> {
         let _guard = self.operation.lock().await;
         let mut p = self.active()?;
@@ -447,6 +459,7 @@ impl Core {
             &p.project.id,
             &p.project.heads,
             &p.installed,
+            &self.known_shared_versions(&p)?,
             &self.data.join("objects"),
         )?;
         self.db
@@ -491,6 +504,7 @@ impl Core {
             &p.project.id,
             &p.project.heads,
             &p.installed,
+            &self.known_shared_versions(&p)?,
             &self.data.join("objects"),
         )?;
         ensure!(

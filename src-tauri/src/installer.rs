@@ -6,7 +6,7 @@ use miliastra_core::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -106,20 +106,42 @@ pub fn matches_file(stage: &Stage, revision: &Revision, cache: &Path) -> Result<
         cache,
     )
 }
+/// Every shared-settings version the team has published, as far as this member knows.
+///
+/// Shared settings have one linear history and always install before the slices, so a slice
+/// shared against an earlier published version still installs into the state the team has.
+/// Only a dependency that appears nowhere in that history (never published, or not synced
+/// yet) is unsafe.
+pub fn known_shared_versions<'a>(
+    heads: &'a BTreeMap<String, Revision>,
+    installed: &'a BTreeMap<String, Revision>,
+    history: impl IntoIterator<Item = &'a Revision>,
+) -> BTreeSet<String> {
+    heads
+        .get("shared")
+        .into_iter()
+        .chain(installed.get("shared"))
+        .chain(history.into_iter().filter(|r| r.section == "shared"))
+        .flat_map(|r| std::iter::once(&r.hash).chain(r.parent.iter()))
+        .cloned()
+        .collect()
+}
 pub fn preview(
     stage: &Stage,
     project: &str,
     heads: &BTreeMap<String, Revision>,
     installed: &BTreeMap<String, Revision>,
+    known_shared: &BTreeSet<String>,
     cache: &Path,
 ) -> Result<Plan> {
-    preview_files(stage, project, heads, installed, cache)
+    preview_files(stage, project, heads, installed, known_shared, cache)
 }
 pub(crate) fn preview_files(
     stage: &Stage,
     project: &str,
     heads: &BTreeMap<String, Revision>,
     installed: &BTreeMap<String, Revision>,
+    known_shared: &BTreeSet<String>,
     cache: &Path,
 ) -> Result<Plan> {
     let shared = heads
@@ -166,8 +188,13 @@ pub(crate) fn preview_files(
             continue;
         }
         miliastra_core::validate_revision(revision)?;
+        // The current shared settings, or an earlier published version that the team has
+        // since moved past (the incoming shared head installs first).
         ensure!(
-            revision.shared_dependency.as_deref() == Some(shared.hash.as_str()),
+            revision
+                .shared_dependency
+                .as_ref()
+                .is_some_and(|d| *d == shared.hash || known_shared.contains(d)),
             "{} requires different shared settings",
             revision.name
         );
@@ -339,6 +366,8 @@ mod tests {
         backups: PathBuf,
         heads: BTreeMap<String, Revision>,
         installed: BTreeMap<String, Revision>,
+        /// Revisions from the synced project history.
+        history: Vec<Revision>,
         old: Vec<u8>,
         incoming: Vec<u8>,
     }
@@ -429,6 +458,7 @@ mod tests {
                 cache,
                 backups,
                 heads: BTreeMap::from([("shared".into(), shared_r.clone()), ("5".into(), new_r)]),
+                history: vec![shared_r.clone(), old_r.clone()],
                 installed: BTreeMap::from([("shared".into(), shared_r), ("5".into(), old_r)]),
                 old,
                 incoming,
@@ -440,6 +470,7 @@ mod tests {
                 "fixture",
                 &self.heads,
                 &self.installed,
+                &known_shared_versions(&self.heads, &self.installed, &self.history),
                 &self.cache,
             )
         }
@@ -698,6 +729,68 @@ mod tests {
             fs::read(binary::resource_path(&f.stage, "5").unwrap()).unwrap(),
             f.old
         );
+    }
+    /// A slice shared before a teammate shared newer shared settings on their own keeps
+    /// pointing at the older shared version. It still applies, together with the newer
+    /// shared settings, instead of blocking the batch until someone reshares the slice.
+    #[test]
+    fn slice_shared_before_a_later_shared_settings_update_still_applies() {
+        let mut f = Fixture::new();
+        let earlier = f.installed["shared"].hash.clone();
+        let donor = with_shared_update(&mut f);
+        f.heads.get_mut("5").unwrap().shared_dependency = Some(earlier.clone());
+        f.history.push(f.heads["shared"].clone());
+        f.history.push(f.heads["5"].clone());
+        let plan = f.plan().unwrap();
+        assert_eq!(
+            plan.revisions
+                .iter()
+                .map(|r| r.section.as_str())
+                .collect::<Vec<_>>(),
+            ["shared", "5"]
+        );
+        let record = prepare(&plan, &f.stage, &f.cache, &f.backups).unwrap();
+        transaction::apply(&record.journal, &f.cache).unwrap();
+        assert_eq!(
+            fs::read(binary::resource_path(&f.stage, "shared").unwrap()).unwrap(),
+            donor
+        );
+        assert_eq!(
+            fs::read(binary::resource_path(&f.stage, "5").unwrap()).unwrap(),
+            f.incoming
+        );
+    }
+    /// The same slice applies on its own once the newer shared settings are installed,
+    /// and the older version is known only from the shared history.
+    #[test]
+    fn slice_depending_on_a_superseded_shared_version_applies_after_shared_is_current() {
+        let mut f = Fixture::new();
+        let earlier = f.installed["shared"].clone();
+        let donor = with_shared_update(&mut f);
+        fs::write(binary::resource_path(&f.stage, "shared").unwrap(), &donor).unwrap();
+        f.installed
+            .insert("shared".into(), f.heads["shared"].clone());
+        f.heads.get_mut("5").unwrap().shared_dependency = Some(earlier.hash.clone());
+        f.history = vec![f.heads["shared"].clone(), f.heads["5"].clone()];
+        let plan = f.plan().unwrap();
+        assert_eq!(plan.revisions.len(), 1);
+        assert_eq!(plan.revisions[0].section, "5");
+        assert!(known_shared_versions(&f.heads, &f.installed, &f.history).contains(&earlier.hash));
+    }
+    #[test]
+    fn unknown_or_missing_shared_dependencies_still_block_the_batch() {
+        let mut f = Fixture::new();
+        with_shared_update(&mut f);
+        f.history.push(f.heads["shared"].clone());
+        for dependency in [Some("d".repeat(64)), None] {
+            f.heads.get_mut("5").unwrap().shared_dependency = dependency;
+            let error = f.plan().err().unwrap().to_string();
+            assert!(
+                error.contains("requires different shared settings"),
+                "{error}"
+            );
+            assert!(!f.backups.exists());
+        }
     }
     #[test]
     fn unshared_local_shared_settings_block_installing_a_teammates_version() {
