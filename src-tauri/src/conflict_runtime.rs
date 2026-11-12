@@ -172,13 +172,18 @@ impl Core {
             .get("shared")
             .context("Shared baseline unavailable")?;
         // A slice needs the team's shared settings installed first, unless the conflict is
-        // on the shared settings themselves.
+        // on the shared settings themselves. The team's slice may have been shared against an
+        // earlier published version of the shared settings; that is still the team's state.
+        let known_shared = self.known_shared_versions(&p)?;
         ensure!(
             is_shared
                 || p.installed
                     .get("shared")
                     .is_some_and(|base| base.hash == shared.hash && self.matches(&stage, base))
-                    && head.shared_dependency.as_deref() == Some(shared.hash.as_str()),
+                    && head
+                        .shared_dependency
+                        .as_ref()
+                        .is_some_and(|d| *d == shared.hash || known_shared.contains(d)),
             "Shared settings changed; resolve their dependencies before choosing a slice"
         );
         if choice == "mine" {
